@@ -1,95 +1,107 @@
-# AI Chip ASP Regression: Predicting Accelerator List Prices from Specs
+# AI Chip Price Prediction Project
 
-## 1. Problem Statement
+## What I tried to build
 
-**Problem.** Given an AI accelerator's specifications, predict its estimated average selling
-price (ASP, in USD). This supports a planning question relevant to the semiconductor market —
-"given a chip's specs, what should it be priced at relative to the market?" — using
-`datasets/raw/ai_chip_market.csv` (120 rows, 30 distinct chips, 2020–2026, 11 vendors).
+The goal of this project is to predict the average selling price of an AI accelerator chip from a small set of product specifications. The target column is `estimated_asp_usd`, so this is a supervised regression problem.
 
-**Problem type.** Supervised regression on tabular data.
+The dataset is `datasets/raw/ai_chip_market.csv`. It has 120 rows, covering 30 different chips from 2020 to 2026. Most rows are repeated yearly observations of the same chip, not truly new chips, so the raw row count is a little misleading. After cleaning, the model is trained on 27 independent chip examples.
 
-**System design decisions:**
+I used a static CSV instead of an API. For this particular topic, that made more sense: there is not a simple free source that gives clean cross-vendor AI chip specs, launch dates, shipment estimates, and ASP values in one place. Keeping the data in the repo also makes the project easy to rerun without API keys or network access.
 
-- **Data source.** Static CSV bundled in `datasets/raw/`, not a live API. The dataset is a
-  curated yearly snapshot of public AI accelerator specs/shipments/pricing; no free API
-  exposes this kind of cross-vendor semiconductor market data, so a static file is the
-  practical choice. This also means the project is fully reproducible offline — no API keys
-  or network access required to retrain.
-- **Latency requirements.** Fully offline/batch. There is no user-facing request that needs a
-  sub-second prediction: new chip launches happen a few times a year, and the on-demand
-  workflow (predicting prices for upcoming chips listed in
-  `batch_prediction_dataset/on_demand_dataset.csv`) is run manually/on a schedule, not per
-  request. This is why the project ships a CD pipeline that retrains on every push to `main`
-  (batch retraining) and a separate on-demand batch-prediction script, rather than a real-time
-  inference endpoint — a few seconds to minutes of latency is entirely acceptable here.
-- **Data transformations** (implemented in `src/transform.py`, see
-  `notebooks/experiments.ipynb` §2–3 for the full investigation):
-  - *Deduplication*: each chip's specs and ASP are reported once per launch but repeated for
-    every year it stayed on the market (all 30 chips have >1 row). Training on raw rows would
-    leak the same chip into both the train and test sets, so rows are collapsed to one per
-    chip before splitting.
-  - *Leakage columns dropped*: `estimated_revenue_usd_m` and `estimated_shipments_units` are
-    priced off ASP (`revenue ≈ ASP × shipments`), so keeping them would leak the target.
-    `chip_name`, `launch_date`, and `description` are identifiers/free text, not model features.
-  - *Invalid rows dropped*: two chips report `estimated_asp_usd == 0` (undisclosed cloud-only
-    pricing, not a free chip), and one (Cerebras WSE-3) reports `memory_gb == 0` with a
-    `$2.5M` ASP — a wafer-scale **system** price, not a per-chip ASP, that would dominate the
-    loss for a 30-row dataset if left in.
-  - *Encoding*: `vendor` is one-hot encoded (11 categories); the encoder is fit once during
-    training and reused as-is for on-demand predictions (`handle_unknown="ignore"` zero-fills
-    a vendor never seen during training instead of raising).
-- **Evaluation strategy.** Only ~27 independent samples remain after cleaning. A single K-fold
-  split is highly sensitive to its random seed — same model, same data, R² ranged from **-2.05
-  to +0.81** depending only on the CV seed (demonstrated in the notebook). The project
-  therefore uses **repeated K-fold CV** (5 splits × 20 repeats) everywhere a metric is reported,
-  both in the notebook comparison and in `src/train.py`.
+This is meant to be a batch ML workflow, not a real-time app. Chip launches do not happen every minute, and the likely use case is periodically retraining the model or scoring a small file of upcoming chips. Because of that, I focused on a reproducible training pipeline, saved model artifacts, MLflow experiment tracking, and an on-demand batch prediction script.
 
-## 2. Model Development
+## Data cleaning and feature decisions
 
-Four regressors of increasing complexity were compared, all evaluated identically with the
-same repeated 5-fold × 20-repeat CV, and each logged to MLflow as its own run (params, CV
-metrics, and the fitted model artifact with an inferred signature). See
-`notebooks/experiments.ipynb` for the full comparison code.
+The first important issue was duplicate chip rows. The same chip appears once for each year that it is present in the market data, but the chip specifications and ASP are basically the same. If I trained directly on the raw rows, the same chip could appear in both training and validation folds. That would make the model look better than it really is. To avoid this, `src/transform.py` keeps only the most recent row for each `chip_name`.
 
-| model | MAE | RMSE | R² (mean) | R² (std) |
-|---|---|---|---|---|
-| **gradient-boosting** (max_depth=2) | **3,200.7** | **5,135.8** | **0.081** | **2.34** |
-| random-forest (max_depth=4) | 3,887.9 | 5,876.1 | -0.367 | 4.61 |
-| ridge-regression (alpha=10) | 6,697.2 | 10,628.5 | -24.95 | 151.00 |
-| linear-regression | 7,042.7 | 9,843.6 | -4.73 | 18.37 |
+I also removed columns that would either leak the answer or not generalize well:
 
-**Chosen model: `GradientBoostingRegressor(max_depth=2, n_estimators=100)`** — it has the
-lowest MAE/RMSE and the least-negative, least-volatile R² of the four. The linear models
-perform poorly (often strongly negative R²) because ASP does not scale additively with specs:
-chips at the high end of TDP/throughput command disproportionately higher prices, a
-nonlinearity that even shallow (depth-2) trees capture, without the model being "overly
-complex" — no extra feature engineering, just 100 small trees. This is the model trained by
-`src/train.py` and shipped via `main.py` / the CD pipeline.
+| Column | Reason for removal |
+|---|---|
+| `chip_name` | Identifier, not a reusable feature |
+| `launch_date` | Mostly redundant with year and too specific for such a small dataset |
+| `description` | Free text, not used in this version of the model |
+| `estimated_shipments_units` | Downstream business estimate, not a chip spec |
+| `estimated_revenue_usd_m` | Closely tied to ASP and shipments, so it leaks target information |
 
-**MLflow screenshots:**
+Two types of invalid training rows were removed. Rows with `estimated_asp_usd == 0` were treated as unknown pricing, not free chips. Rows with `memory_gb == 0` were also removed because they represent system-level products rather than normal chip-level products. One example is the Cerebras wafer-scale system, whose price would dominate the loss in a dataset this small.
 
-> _TODO (manual step): run `mlflow ui` from the project root, open
-> http://127.0.0.1:5000, select the `ai-chip-asp-regression` experiment, and paste
-> screenshots here — one of the 4-run comparison table, and one of the
-> `gradient-boosting` run's params/metrics/artifacts page._
+The final feature set is intentionally simple:
 
-## 3. Conclusions
+| Feature group | Columns |
+|---|---|
+| Numeric specs | `year`, `memory_gb`, `fp16_tflops`, `tdp_watts` |
+| Categorical feature | `vendor`, one-hot encoded |
 
-This project builds an end-to-end training pipeline that predicts an AI accelerator's ASP from
-its specs: `src/load.py` → `src/transform.py` → `src/train.py` → `src/store.py`, orchestrated
-by `main.py` and retrained automatically by the CD pipeline on every push to `main`. Experiments
-across 4 candidate models are tracked in MLflow (`notebooks/experiments.ipynb`), and a separate
-on-demand workflow (`src/predict.py`) scores new, unreleased chips listed in
-`batch_prediction_dataset/on_demand_dataset.csv` using the exact same fitted encoder as
-training, writing predictions back into that folder.
+The fitted one-hot encoder is saved together with the model, so `src/predict.py` can transform new chips in the same way as training data. Unknown vendors are handled with `handle_unknown="ignore"`, which is useful for batch scoring because a new vendor should not crash the prediction workflow.
 
-The most important finding wasn't the model choice — it was the data itself: with only ~27
-independent samples after fixing leakage and removing two data-quality outliers, evaluation
-metrics (especially R²) are inherently noisy, and a single train/test split would have been
-actively misleading (it produced a misleadingly good R²=0.71 before repeated CV exposed how
-seed-dependent that number was). The final model, gradient boosting with shallow trees,
-achieves MAE ≈ $3.2K and RMSE ≈ $5.1K against a target ranging roughly $8K–$65K — a reasonable
-but not highly precise fit, which is an honest reflection of how little data is available
-rather than a modeling shortcoming. More chips/vendors, or finer-grained specs (e.g. process
-node, memory bandwidth), would be the most direct way to improve on this.
+## Modeling approach
+
+I compared four models in `notebooks/experiments.ipynb` and logged each one to MLflow:
+
+| Model | MAE | RMSE | Mean R2 | R2 std |
+|---|---:|---:|---:|---:|
+| Gradient Boosting | 3,199.0 | 5,133.6 | 0.081 | 2.340 |
+| Random Forest | 3,887.9 | 5,876.1 | -0.367 | 4.605 |
+| Ridge Regression | 6,697.2 | 10,628.5 | -24.952 | 151.004 |
+| Linear Regression | 7,042.7 | 9,843.6 | -4.729 | 18.373 |
+
+I used repeated cross-validation instead of one train/test split: 5 folds repeated 20 times. This was necessary because the cleaned dataset is tiny. With only 27 usable chips, a single split can change the result a lot depending on which products land in validation. Repeating the folds gives a less fragile estimate.
+
+The best model was `GradientBoostingRegressor(n_estimators=100, max_depth=2, random_state=42)`. It had the lowest MAE and RMSE, so it is the model used by `main.py`.
+
+I did not choose the most complex possible model. With this little data, a bigger model would be easy to overfit. Shallow gradient boosting is a reasonable compromise: it can model nonlinear relationships between specs and price, but the trees are still constrained.
+
+The weak R2 is also worth being honest about. The model is useful as a rough pricing estimate, but it is not a high-confidence pricing engine. The dataset is too small and the market is too messy for that. The MAE of about $3.2K is acceptable relative to prices that range from about $15K to $65K after cleaning, but there is definitely room for better data.
+
+## MLflow evidence
+
+The experiment is called `ai-chip-asp-regression`.
+
+Screenshot 1: MLflow comparison table with the four completed runs.
+
+![MLflow comparison table](screenshots/mlflow-comparison-table.png)
+
+Screenshot 2: Detail page for the `gradient-boosting` run, showing parameters, metrics, and model artifacts.
+
+![Gradient boosting run details](screenshots/mlflow-gradient-boosting-run.png)
+
+The model runs were logged with parameters, metrics, tags, and a saved sklearn model artifact. The logged artifact includes the fitted model signature and an input example, which makes the run easier to inspect later.
+
+## Pipeline and MLOps pieces
+
+The training pipeline is split into small modules:
+
+| File | Role |
+|---|---|
+| `src/load.py` | Reads the raw CSV |
+| `src/transform.py` | Cleans rows, removes leakage columns, and one-hot encodes vendor |
+| `src/train.py` | Trains the final gradient boosting model and evaluates it |
+| `src/store.py` | Saves the trained model bundle as a timestamped `.joblib` file |
+| `main.py` | Runs the full training flow |
+| `src/predict.py` | Loads the latest model and scores the on-demand prediction CSV |
+
+The saved artifact is a bundle containing both the trained model and the fitted transformer. That matters because prediction data must go through the same encoding as training data. Without saving the transformer, the batch prediction step could easily end up with mismatched columns.
+
+There are also GitHub Actions workflows:
+
+| Workflow | Purpose |
+|---|---|
+| `.github/workflows/ci.yaml` | Installs dependencies and runs the test suite |
+| `.github/workflows/cd.yaml` | Runs `main.py` and commits a newly trained model artifact |
+
+This is a simple setup, but it covers the main MLOps flow for a small project: data in the repo, deterministic preprocessing, repeatable training, experiment tracking, model persistence, tests, and a batch prediction path.
+
+## What I would improve next
+
+The biggest limitation is not the algorithm. It is the amount and quality of data. A better version of this project would add more chips, more vendors, and more technical features such as memory bandwidth, process node, die area, interconnect type, and whether the product is sold as a card, chip, or full system.
+
+I would also separate system-level products from chip-level products more formally. Right now those rows are removed with simple rules, which is fine for this dataset, but a larger dataset should have an explicit product category column.
+
+Finally, I would add a small model registry step or a clearer promotion rule. At the moment, the CD workflow retrains and saves a new model, but it does not decide whether the new model is actually better than the previous one. A practical next step would be to compare the new MLflow run against the current production model before saving or promoting it.
+
+## Conclusion
+
+The final project is a compact batch ML system for estimating AI chip ASP from product specs. Gradient boosting performed best among the tested models, with an MAE around $3.2K. The result is useful as a rough estimate, but the evaluation also shows the main reality of the project: with only 27 cleaned examples, model choice matters less than getting more reliable data.
+
+Even so, the pipeline is structured in a way that can grow. More data could be added to the CSV, the same training command could be rerun, MLflow would track the new experiment results, and the prediction script would continue using the saved transformer/model bundle for on-demand scoring.
