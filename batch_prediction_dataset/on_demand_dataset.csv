@@ -1,0 +1,4 @@
+year,chip_name,vendor,launch_date,memory_gb,fp16_tflops,tdp_watts,description
+2026,NVIDIA B300,NVIDIA,2026-03-01,288,1400,1200,Next-gen Blackwell Ultra data center GPU
+2026,AMD MI400,AMD,2026-02-01,256,1100,1000,Next-gen Instinct accelerator
+2026,Google TPU v7,Google,2026-01-15,192,900,700,Next-gen Ironwood TPU
