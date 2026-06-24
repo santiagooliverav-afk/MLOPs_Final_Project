@@ -1,5 +1,7 @@
 # AI Chip Price Prediction Project
 
+## Contributors: Santiago Olivera Vaquero and Jason Jonas Smith
+
 ## What I tried to build
 
 The goal of this project is to predict the average selling price of an AI accelerator chip from a small set of product specifications. The target column is `estimated_asp_usd`, so this is a supervised regression problem.
